@@ -1,2 +1,6 @@
-# adbms-project2-group25
-ADBMS Project 2 - Group 25 (3 members)
+# ADBMS Project 2 - Group 25
+Final Project Title: TBD
+Members:
+- BSCS24063 : Mubeen Butt
+- BSCS24075 : Muhammad Bin Asghar Ghouri
+- BSCS24045 : Israr Hussain

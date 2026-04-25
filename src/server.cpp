@@ -63,7 +63,7 @@ void Server::run() {
         return;
     }
 
-    if (listen_fd < 0) {
+    if (listen(listen_fd, 64) < 0) {
         cerr << "ERROR: listen() failed: " << strerror(errno) << "\n";
         close(listen_fd);
         return;

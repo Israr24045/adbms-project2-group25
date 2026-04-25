@@ -1,4 +1,4 @@
-# ADBMS Project 2 - Group 25
+# ADBMS Project 2 - TSDB
 Final Project Title: Time Series Database Engine
 
 Members:

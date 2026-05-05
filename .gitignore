@@ -1,2 +1,4 @@
 build/
 tsdb
+tests/test_bitstream
+tests/test_compress

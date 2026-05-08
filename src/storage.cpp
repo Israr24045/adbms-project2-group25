@@ -1,5 +1,10 @@
 #include "storage.h"
 
+#include <algorithm>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <iostream>
+
 using namespace std;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -50,6 +55,22 @@ HeadBlock::RangeResult HeadBlock::range(int64_t from_ts, int64_t to_ts) const
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MetricDiskState
+// ─────────────────────────────────────────────────────────────────────────────
+
+void MetricDiskState::add_chunk(const ChunkMeta& meta) {
+    chunks.push_back(meta);
+    total_disk_points += meta.point_count;
+}
+
+void MetricDiskState::sort_chunks() {
+    sort(chunks.begin(), chunks.end(),
+         [](const ChunkMeta& a, const ChunkMeta& b) {
+             return a.first_ts < b.first_ts;
+         });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MetricRegistry
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -93,4 +114,171 @@ vector<string> MetricRegistry::metric_names() const
         names.push_back(pair.first);
     }
     return names;
+}
+
+MetricDiskState* MetricRegistry::get_or_create_disk(const string& name) {
+    lock_guard<mutex> lk(map_lock_);
+
+    auto it = disk_state_.find(name);
+    if (it != disk_state_.end())
+        return it->second.get();
+
+    auto ds = make_unique<MetricDiskState>();
+    MetricDiskState* raw = ds.get();
+    disk_state_.emplace(name, move(ds));
+    return raw;
+}
+
+MetricDiskState* MetricRegistry::get_disk(const string& name) {
+    lock_guard<mutex> lk(map_lock_);
+
+    auto it = disk_state_.find(name);
+    if (it != disk_state_.end())
+        return it->second.get();
+    return nullptr;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flush
+// ─────────────────────────────────────────────────────────────────────────────
+
+FlushStats MetricRegistry::flush_metric(const string& name, const string& data_dir) {
+    HeadBlock* block = get(name);
+    if (!block) return {};
+
+    // Take the data out of the head block under lock
+    vector<int64_t> ts_copy;
+    vector<double>  val_copy;
+    {
+        lock_guard<mutex> lk(block->lock);
+        if (block->timestamps.empty()) return {};
+        ts_copy  = block->timestamps;
+        val_copy = block->values;
+        block->clear();
+    }
+
+    // Write the chunk (no lock needed — writing to a new file)
+    string metric_dir = data_dir + "/" + name;
+    FlushStats stats = write_chunk(metric_dir, ts_copy, val_copy);
+
+    if (stats.total_bytes > 0) {
+        // Register the chunk in disk state
+        ChunkMeta meta;
+        meta.filepath    = metric_dir + "/" + to_string(ts_copy.front()) + ".chunk";
+        meta.first_ts    = ts_copy.front();
+        meta.last_ts     = ts_copy.back();
+        meta.point_count = (uint32_t)ts_copy.size();
+
+        MetricDiskState* ds = get_or_create_disk(name);
+        lock_guard<mutex> lk(ds->lock);
+        ds->add_chunk(meta);
+        ds->sort_chunks();
+    }
+
+    return stats;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scan data directory at startup
+// ─────────────────────────────────────────────────────────────────────────────
+
+void MetricRegistry::scan_data_dir(const string& data_dir) {
+    DIR* top = opendir(data_dir.c_str());
+    if (!top) return;  // No data directory yet — that's OK
+
+    struct dirent* entry;
+    while ((entry = readdir(top)) != nullptr) {
+        string dname = entry->d_name;
+        if (dname == "." || dname == "..") continue;
+
+        string metric_path = data_dir + "/" + dname;
+        struct stat st;
+        if (stat(metric_path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+            continue;
+
+        // This subdirectory is a metric name
+        string metric_name = dname;
+
+        // Ensure the metric exists in registry
+        get_or_create(metric_name);
+        MetricDiskState* ds = get_or_create_disk(metric_name);
+
+        // Scan chunk files
+        DIR* mdir = opendir(metric_path.c_str());
+        if (!mdir) continue;
+
+        struct dirent* chunk_entry;
+        while ((chunk_entry = readdir(mdir)) != nullptr) {
+            string fname = chunk_entry->d_name;
+            if (fname.size() < 7) continue;  // need at least "X.chunk"
+            if (fname.substr(fname.size() - 6) != ".chunk") continue;
+
+            string chunk_path = metric_path + "/" + fname;
+            ChunkMeta meta = read_chunk_meta(chunk_path);
+            if (meta.point_count > 0) {
+                lock_guard<mutex> lk(ds->lock);
+                ds->add_chunk(meta);
+            }
+        }
+        closedir(mdir);
+
+        // Sort chunks by first_ts
+        {
+            lock_guard<mutex> lk(ds->lock);
+            ds->sort_chunks();
+        }
+
+        cout << "  loaded metric: " << metric_name
+             << " (" << ds->chunks.size() << " chunks, "
+             << ds->total_disk_points << " points on disk)\n";
+    }
+    closedir(top);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Full range query: disk chunks + head block
+// ─────────────────────────────────────────────────────────────────────────────
+
+HeadBlock::RangeResult MetricRegistry::full_range(const string& name,
+                                                   int64_t from_ts, int64_t to_ts) {
+    HeadBlock::RangeResult result;
+
+    // 1. Read matching chunks from disk
+    MetricDiskState* ds = get_disk(name);
+    if (ds) {
+        lock_guard<mutex> lk(ds->lock);
+        for (const auto& meta : ds->chunks) {
+            // Skip chunks that don't overlap the query range [from_ts, to_ts)
+            if (meta.last_ts < from_ts || meta.first_ts >= to_ts)
+                continue;
+
+            // Decompress this chunk
+            ChunkData chunk = read_chunk(meta.filepath);
+            if (!chunk.valid) continue;
+
+            for (size_t i = 0; i < chunk.timestamps.size(); ++i) {
+                int64_t ts = chunk.timestamps[i];
+                if (ts >= from_ts && ts < to_ts) {
+                    result.timestamps.push_back(ts);
+                    result.values.push_back(chunk.values[i]);
+                }
+                if (ts >= to_ts) break;
+            }
+        }
+    }
+
+    // 2. Read from head block
+    HeadBlock* block = get(name);
+    if (block) {
+        lock_guard<mutex> lk(block->lock);
+        auto head_range = block->range(from_ts, to_ts);
+        result.timestamps.insert(result.timestamps.end(),
+                                  head_range.timestamps.begin(),
+                                  head_range.timestamps.end());
+        result.values.insert(result.values.end(),
+                              head_range.values.begin(),
+                              head_range.values.end());
+    }
+
+    return result;
 }

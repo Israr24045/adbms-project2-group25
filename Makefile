@@ -35,12 +35,20 @@ $(TEST_DIR)/test_compress: all
 	    $(OBJ_DIR)/bitstream.o $(OBJ_DIR)/compress.o \
 	    -o $(TEST_DIR)/test_compress
 
-tests: $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress
+$(TEST_DIR)/test_chunk: all
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) \
+	    $(TEST_DIR)/test_chunk.cpp \
+	    $(OBJ_DIR)/bitstream.o $(OBJ_DIR)/compress.o $(OBJ_DIR)/chunk.o \
+	    -o $(TEST_DIR)/test_chunk
+
+tests: $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress $(TEST_DIR)/test_chunk
 	@echo "--- Running bitstream test ---"
 	./$(TEST_DIR)/test_bitstream
 	@echo "--- Running compress test ---"
 	./$(TEST_DIR)/test_compress
+	@echo "--- Running chunk test ---"
+	./$(TEST_DIR)/test_chunk
 
 clean:
 	rm -rf $(OBJ_DIR) $(TARGET) \
-	    $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress
+	    $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress $(TEST_DIR)/test_chunk

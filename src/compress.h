@@ -4,43 +4,53 @@
 
 // ── Timestamp — delta-of-delta encoding (Gorilla Section 4.1.1) ────────────
 
-class TimestampEncoder {
+class TimestampEncoder
+{
 public:
-    void encode(BitWriter& bw, int64_t ts);
+    void encode(BitWriter &bw, int64_t ts);
+
 private:
-    int64_t prev_ts_    = 0;
+    int64_t prev_ts_ = 0;
     int64_t prev_delta_ = 0;
-    int     count_      = 0;
+    int count_ = 0;
 };
 
-class TimestampDecoder {
+class TimestampDecoder
+{
 public:
-    int64_t decode(BitReader& br);
+    int64_t decode(BitReader &br);
+
 private:
-    int64_t prev_ts_    = 0;
+    int64_t prev_ts_ = 0;
     int64_t prev_delta_ = 0;
-    int     count_      = 0;
+    int count_ = 0;
 };
 
 // ── Value — XOR encoding (Gorilla Section 4.1.2) ───────────────────────────
 
-class ValueEncoder {
+class ValueEncoder
+{
 public:
-    void encode(BitWriter& bw, double val);
+    void encode(BitWriter &bw, double val);
+
 private:
-    uint64_t prev_bits_     = 0;
-    int      prev_leading_  = 0;
-    int      prev_trailing_ = 0;
-    bool     first_         = true;
-    bool     has_prev_xor_  = false;
+    uint64_t prev_bits_ = 0;
+    int prev_leading_ = 0;
+    int prev_n_meaningful_ = 0;
+    int prev_trailing_ = 0; // stored explicitly to avoid recomputation mismatch
+    bool first_ = true;
+    bool has_prev_xor_ = false;
 };
 
-class ValueDecoder {
+class ValueDecoder
+{
 public:
-    double decode(BitReader& br);
+    double decode(BitReader &br);
+
 private:
-    uint64_t prev_bits_     = 0;
-    int      prev_leading_  = 0;
-    int      prev_trailing_ = 0;
-    bool     first_         = true;
+    uint64_t prev_bits_ = 0;
+    int prev_leading_ = 0;
+    int prev_n_meaningful_ = 0;
+    int prev_trailing_ = 0; // stored explicitly
+    bool first_ = true;
 };

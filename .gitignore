@@ -7,3 +7,9 @@ tests/test_compress
 tests/test_chunk
 build/
 tsdb
+data/
+tests/test_bitstream
+tests/test_compress
+tests/test_chunk
+build/
+tsdb

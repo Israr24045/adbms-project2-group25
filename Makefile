@@ -1,16 +1,17 @@
 CXX      = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -pthread
 
-SRC_DIR  = src
-OBJ_DIR  = build
-TEST_DIR = tests
+SRC_DIR   = src
+OBJ_DIR   = build
+TEST_DIR  = tests
+BENCH_DIR = benchmark
 
 SRCS = $(wildcard $(SRC_DIR)/*.cpp)
 OBJS = $(patsubst $(SRC_DIR)/%.cpp, $(OBJ_DIR)/%.o, $(SRCS))
 
 TARGET = tsdb
 
-.PHONY: all clean tests
+.PHONY: all clean tests bench
 
 all: $(OBJ_DIR) $(TARGET)
 
@@ -49,6 +50,12 @@ tests: $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress $(TEST_DIR)/test_chu
 	@echo "--- Running chunk test ---"
 	./$(TEST_DIR)/test_chunk
 
+bench: $(BENCH_DIR)/benchmark
+
+$(BENCH_DIR)/benchmark: $(BENCH_DIR)/benchmark.cpp
+	$(CXX) $(CXXFLAGS) -o $(BENCH_DIR)/benchmark $(BENCH_DIR)/benchmark.cpp
+
 clean:
 	rm -rf $(OBJ_DIR) $(TARGET) \
-	    $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress $(TEST_DIR)/test_chunk
+	    $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress $(TEST_DIR)/test_chunk \
+	    $(BENCH_DIR)/benchmark

@@ -8,6 +8,7 @@
 #include <thread>
 #include <iomanip>
 
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -95,6 +96,9 @@ void Server::run()
             continue;
         }
 
+        int nodelay = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
         thread(&Server::handle_client, this, client_fd).detach();
     }
 }
@@ -102,6 +106,7 @@ void Server::run()
 void Server::handle_client(int client_fd)
 {
     string buffer;
+    size_t buffer_start = 0;
     char recv_buf[4096];
 
     while (true)
@@ -114,10 +119,14 @@ void Server::handle_client(int client_fd)
         buffer.append(recv_buf, n);
 
         size_t pos;
-        while ((pos = buffer.find('\n')) != string::npos)
+        while ((pos = buffer.find('\n', buffer_start)) != string::npos)
         {
-            string line = buffer.substr(0, pos);
-            buffer.erase(0, pos + 1);
+            string line = buffer.substr(buffer_start, pos - buffer_start);
+            buffer_start = pos + 1;
+            if (buffer_start > 8192) {
+                buffer.erase(0, buffer_start);
+                buffer_start = 0;
+            }
 
             if (!line.empty() && line.back() == '\r')
             {

@@ -1,5 +1,5 @@
 #pragma once
-#include<iostream>
+#include <iostream>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -12,15 +12,17 @@ using namespace std;
 
 static constexpr size_t DEFAULT_HEAD_CAPACITY = 4096;
 
-struct HeadBlock {
+struct HeadBlock
+{
 
     vector<int64_t> timestamps;
-    vector<double>  values;
+    vector<double> values;
     int64_t last_timestamp = INT64_MIN;
     size_t capacity = DEFAULT_HEAD_CAPACITY;
     mutable mutex lock;
 
-    enum class AppendResult { 
+    enum class AppendResult
+    {
         OK,
         OUT_OF_ORDER,
         BLOCK_FULL
@@ -28,25 +30,30 @@ struct HeadBlock {
 
     AppendResult append(int64_t ts, double val);
 
-    struct RangeResult {
+    struct RangeResult
+    {
         vector<int64_t> timestamps;
-        vector<double>  values;
+        vector<double> values;
     };
 
     RangeResult range(int64_t from_ts, int64_t to_ts) const;
 
-    size_t  count() const { 
-        return timestamps.size(); 
+    size_t count() const
+    {
+        return timestamps.size();
     }
-    int64_t first_timestamp() const {
-         return timestamps.empty() ? 0 : timestamps.front(); 
+    int64_t first_timestamp() const
+    {
+        return timestamps.empty() ? 0 : timestamps.front();
     }
-    int64_t last_ts() const {
-         return timestamps.empty() ? 0 : timestamps.back(); 
+    int64_t last_ts() const
+    {
+        return timestamps.empty() ? 0 : timestamps.back();
     }
 
     // Clear the head block after a flush
-    void clear() {
+    void clear()
+    {
         timestamps.clear();
         values.clear();
         last_timestamp = INT64_MIN;
@@ -54,33 +61,54 @@ struct HeadBlock {
 };
 
 // Per-metric disk state: cached chunk metadata sorted by first_ts
-struct MetricDiskState {
+struct MetricDiskState
+{
     mutable mutex lock;
-    vector<ChunkMeta> chunks;   // sorted by first_ts ascending
+    vector<ChunkMeta> chunks; // sorted by first_ts ascending
     size_t total_disk_points = 0;
 
-    void add_chunk(const ChunkMeta& meta);
+    void add_chunk(const ChunkMeta &meta);
     void sort_chunks();
 };
 
-class MetricRegistry {
+// AGG result types
+struct AggBucket
+{
+    int64_t bucket_start = 0;
+    int64_t bucket_end = 0;
+    double value = 0.0;
+    size_t count = 0;
+};
+
+struct AggResult
+{
+    vector<AggBucket> buckets;
+};
+
+class MetricRegistry
+{
 public:
-    HeadBlock* get_or_create(const string& name);
-    HeadBlock* get(const string& name);
+    HeadBlock *get_or_create(const string &name);
+    HeadBlock *get(const string &name);
     vector<string> metric_names() const;
 
-    MetricDiskState* get_or_create_disk(const string& name);
-    MetricDiskState* get_disk(const string& name);
+    MetricDiskState *get_or_create_disk(const string &name);
+    MetricDiskState *get_disk(const string &name);
 
-    FlushStats flush_metric(const string& name, const string& data_dir);
+    FlushStats flush_metric(const string &name, const string &data_dir);
 
-    void scan_data_dir(const string& data_dir);
+    void scan_data_dir(const string &data_dir);
 
-    HeadBlock::RangeResult full_range(const string& name,
-                                     int64_t from_ts, int64_t to_ts);
+    HeadBlock::RangeResult full_range(const string &name,
+                                      int64_t from_ts, int64_t to_ts);
+
+    AggResult agg_range(const string &name,
+                        int64_t from_ts, int64_t to_ts,
+                        int64_t bucket_seconds,
+                        const string &func);
 
 private:
     mutable mutex map_lock_;
-    unordered_map<string, unique_ptr<HeadBlock>>      metrics_;
+    unordered_map<string, unique_ptr<HeadBlock>> metrics_;
     unordered_map<string, unique_ptr<MetricDiskState>> disk_state_;
 };

@@ -42,13 +42,21 @@ $(TEST_DIR)/test_chunk: all
 	    $(OBJ_DIR)/bitstream.o $(OBJ_DIR)/compress.o $(OBJ_DIR)/chunk.o \
 	    -o $(TEST_DIR)/test_chunk
 
-tests: $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress $(TEST_DIR)/test_chunk
+$(TEST_DIR)/test_bonus: all
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) \
+	    $(TEST_DIR)/test_bonus.cpp \
+	    $(OBJ_DIR)/bitstream.o $(OBJ_DIR)/compress.o $(OBJ_DIR)/chunk.o $(OBJ_DIR)/storage.o $(OBJ_DIR)/wal.o \
+	    -o $(TEST_DIR)/test_bonus
+
+tests: $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress $(TEST_DIR)/test_chunk $(TEST_DIR)/test_bonus
 	@echo "--- Running bitstream test ---"
 	./$(TEST_DIR)/test_bitstream
 	@echo "--- Running compress test ---"
 	./$(TEST_DIR)/test_compress
 	@echo "--- Running chunk test ---"
 	./$(TEST_DIR)/test_chunk
+	@echo "--- Running Part 3 Integration/Bonus tests ---"
+	./$(TEST_DIR)/test_bonus
 
 bench: $(BENCH_DIR)/benchmark
 
@@ -57,5 +65,5 @@ $(BENCH_DIR)/benchmark: $(BENCH_DIR)/benchmark.cpp
 
 clean:
 	rm -rf $(OBJ_DIR) $(TARGET) \
-	    $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress $(TEST_DIR)/test_chunk \
+	    $(TEST_DIR)/test_bitstream $(TEST_DIR)/test_compress $(TEST_DIR)/test_chunk $(TEST_DIR)/test_bonus \
 	    $(BENCH_DIR)/benchmark

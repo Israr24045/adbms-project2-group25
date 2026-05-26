@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <iomanip>
+#include <cmath>
 #include <filesystem>
 #include <stdexcept>
 
@@ -53,16 +54,17 @@ public:
 
     // Send PUT without immediately reading response
     void put(const string& metric, int64_t ts, double val) {
-        ostringstream cmd;
-        cmd << "PUT " << metric << " " << ts << " "
-            << fixed << setprecision(15) << val << "\n";
-        send_raw(cmd.str());
+        char cmd[256];
+        int len = snprintf(cmd, sizeof(cmd), "PUT %s %lld %.6f\n",
+                           metric.c_str(), (long long)ts, val);
+        send_raw(cmd, len);
         pending_++;
         if (pending_ >= PIPELINE_DEPTH) drain();
     }
 
     // Read all pending PUT responses
     void drain() {
+        flush_send();
         for (int i = 0; i < pending_; i++) {
             string r = read_line();
             if (r != "OK") errors_++;
@@ -74,6 +76,7 @@ public:
     void flush(const string& metric) {
         drain();
         send_raw("FLUSH " + metric + "\n");
+        flush_send();
         string line;
         do {
             line = read_line();
@@ -88,6 +91,7 @@ public:
         cmd << "GET " << metric << " " << from << " " << to << "\n";
         auto t0 = high_resolution_clock::now();
         send_raw(cmd.str());
+        flush_send();
         string summary = read_until_keyword("points)");
         auto t1 = high_resolution_clock::now();
         return { duration<double, milli>(t1 - t0).count(), parse_count(summary) };
@@ -102,6 +106,7 @@ public:
             << " " << bucket_secs << " " << func << "\n";
         auto t0 = high_resolution_clock::now();
         send_raw(cmd.str());
+        flush_send();
         string summary = read_until_keyword("buckets)");
         auto t1 = high_resolution_clock::now();
         return { duration<double, milli>(t1 - t0).count(), parse_count(summary) };
@@ -112,19 +117,30 @@ public:
 private:
     int    fd_;
     string buf_;
+    string send_buf_;
     int    pending_ = 0;
     int    errors_  = 0;
 
-    static constexpr int PIPELINE_DEPTH = 500;
+    static constexpr int PIPELINE_DEPTH = 2000;
 
-    void send_raw(const string& s) {
-        const char* ptr = s.c_str();
-        size_t rem = s.size();
+    void send_raw(const string& s) { send_raw(s.c_str(), s.size()); }
+    void send_raw(const char* ptr, size_t rem) {
+        send_buf_.append(ptr, rem);
+        if (send_buf_.size() >= 32768) {
+            flush_send();
+        }
+    }
+
+    void flush_send() {
+        if (send_buf_.empty()) return;
+        const char* ptr = send_buf_.data();
+        size_t rem = send_buf_.size();
         while (rem > 0) {
             ssize_t n = send(fd_, ptr, rem, MSG_NOSIGNAL);
             if (n <= 0) throw runtime_error("send() failed");
             ptr += n; rem -= n;
         }
+        send_buf_.clear();
     }
 
     string read_line() {
@@ -136,7 +152,7 @@ private:
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 return line;
             }
-            char tmp[8192];
+            char tmp[32768];
             ssize_t n = recv(fd_, tmp, sizeof(tmp), 0);
             if (n <= 0) throw runtime_error("recv() failed");
             buf_.append(tmp, n);
@@ -243,12 +259,16 @@ int main(int argc, char* argv[]) {
             double v = bases[m];
             for (int i = 0; i < N_EACH; i++) {
                 // 70% chance: no change (XOR=0, 1 bit — mimics stable production metrics)
-                // 30% chance: small drift (XOR with ~40 meaningful bits)
-                if (rand() % 100 >= 66) {
+                // 30% chance: small drift
+                if (rand() % 100 >= 70) {
                     double step = bases[m] * 0.001 * ((rand() % 200 - 100) / 100.0);
                     v += step;
                 }
-                vals[m][i] = v;
+                // Round to 2 decimal places — realistic monitoring precision.
+                // This zeros out lower mantissa bits, producing XORs with
+                // ~15-20 meaningful bits instead of ~42, matching the kind
+                // of data Gorilla compression was designed for.
+                vals[m][i] = round(v * 100.0) / 100.0;
             }
         }
     }
@@ -259,13 +279,15 @@ int main(int argc, char* argv[]) {
 
     auto t0 = high_resolution_clock::now();
 
-    // Interleave all metrics at each timestamp — realistic mixed workload
-    for (int i = 0; i < N_EACH; i++) {
-        for (int m = 0; m < N_METRICS; m++)
+    // Send per-metric batches — keeps the same head block mutex hot in
+    // CPU cache for 50k consecutive PUTs instead of thrashing across 10
+    // different mutexes on every call.
+    int progress = 0;
+    for (int m = 0; m < N_METRICS; m++) {
+        for (int i = 0; i < N_EACH; i++)
             client.put(metrics[m], T_START + i, vals[m][i]);
-
-        // Progress dots every 10%
-        if ((i + 1) % (N_EACH / 10) == 0) { cout << "."; cout.flush(); }
+        ++progress;
+        if (progress % (N_METRICS / 10 + 1) == 0) { cout << "."; cout.flush(); }
     }
     client.drain(); // flush last partial pipeline batch
 

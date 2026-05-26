@@ -5,12 +5,14 @@
 #include <unordered_map>
 #include <vector>
 #include <memory>
+#include <atomic>
 
 #include "chunk.h"
+#include "wal.h"
 
 using namespace std;
 
-static constexpr size_t DEFAULT_HEAD_CAPACITY = 4096;
+static constexpr size_t DEFAULT_HEAD_CAPACITY = 10000;
 
 struct HeadBlock
 {
@@ -64,7 +66,8 @@ struct HeadBlock
 struct MetricDiskState
 {
     mutable mutex lock;
-    vector<ChunkMeta> chunks; // sorted by first_ts ascending
+    vector<ChunkMeta> chunks;       // sorted by first_ts ascending
+    vector<ChunkMeta> downsampled;  // downsampled chunks (1pt/min), same sort
     size_t total_disk_points = 0;
 
     void add_chunk(const ChunkMeta &meta);
@@ -107,8 +110,27 @@ public:
                         int64_t bucket_seconds,
                         const string &func);
 
+    // ── Bonus 1: WAL ──────────────────────────────────────────────────────
+    WAL *get_or_create_wal(const string &name, const string &data_dir);
+    void replay_wals(const string &data_dir);
+
+    // ── Bonus 2: Retention ────────────────────────────────────────────────
+    void set_retention(const string &name, int64_t max_age_seconds);
+    void set_default_retention(int64_t max_age_seconds);
+    void enforce_retention(int64_t now_ts, const string &data_dir);
+
+    // ── Bonus 3: Downsampling ─────────────────────────────────────────────
+    void downsample_chunk(const string &name, const string &data_dir,
+                          const ChunkMeta &meta, int64_t now_ts);
+    void downsample_old_chunks(const string &data_dir, int64_t now_ts);
+
 private:
     mutable mutex map_lock_;
     unordered_map<string, unique_ptr<HeadBlock>> metrics_;
     unordered_map<string, unique_ptr<MetricDiskState>> disk_state_;
+    unordered_map<string, unique_ptr<WAL>> wals_;
+
+    // Retention: per-metric max age in seconds (0 = no retention)
+    unordered_map<string, int64_t> retention_;
+    int64_t default_retention_ = 0;
 };

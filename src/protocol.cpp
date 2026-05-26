@@ -3,18 +3,40 @@
 #include <sstream>
 #include <vector>
 #include <stdexcept>
+#include <cstring>
+#include <cstdlib>
 
 using namespace std;
 
-// Split a line into whitespace-separated tokens
+// ── Fast token splitter (no istringstream, no heap vector for small counts) ──
+
+// Find the next whitespace-delimited token starting at pos.
+// Returns {token_start, token_end} or {npos, npos} if no more tokens.
+static pair<size_t, size_t> next_token(const string &line, size_t pos)
+{
+    // skip leading spaces
+    while (pos < line.size() && line[pos] == ' ')
+        ++pos;
+    if (pos >= line.size())
+        return {string::npos, string::npos};
+    size_t end = pos;
+    while (end < line.size() && line[end] != ' ')
+        ++end;
+    return {pos, end};
+}
+
+// Split a line into whitespace-separated tokens (general fallback)
 static vector<string> tokenize(const string &line)
 {
     vector<string> tokens;
-    istringstream iss(line);
-    string tok;
-    while (iss >> tok)
+    size_t pos = 0;
+    while (true)
     {
-        tokens.push_back(tok);
+        auto [s, e] = next_token(line, pos);
+        if (s == string::npos)
+            break;
+        tokens.push_back(line.substr(s, e - s));
+        pos = e;
     }
     return tokens;
 }
@@ -49,6 +71,31 @@ static bool parse_double(const string &s, double &out)
     }
 }
 
+static bool fast_parse_int64(const char* start, const char* end, int64_t &out) {
+    if (start == end) return false;
+    int64_t val = 0;
+    bool neg = false;
+    if (*start == '-') { neg = true; ++start; }
+    if (start == end) return false;
+    for (const char* p = start; p < end; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        val = val * 10 + (*p - '0');
+    }
+    out = neg ? -val : val;
+    return true;
+}
+
+static bool fast_parse_double(const char* start, const char* end, double &out) {
+    char buf[64];
+    size_t len = end - start;
+    if (len >= sizeof(buf) || len == 0) return false;
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    char* endptr;
+    out = strtod(buf, &endptr);
+    return endptr == buf + len;
+}
+
 // Validate metric name: letters, digits, dots, underscores only
 static bool valid_metric_name(const string &name)
 {
@@ -62,9 +109,86 @@ static bool valid_metric_name(const string &name)
     return true;
 }
 
+// ── Fast-path PUT parser ─────────────────────────────────────────────────────
+// PUT is the hot path during ingestion (~500k calls).  Avoid vector/istringstream.
+static Command parse_put_fast(const string &line)
+{
+    Command cmd;
+
+    // Skip "PUT " (we already know line starts with "PUT")
+    auto [s1, e1] = next_token(line, 4); // metric_name
+    if (s1 == string::npos)
+    {
+        cmd.type = CommandType::UNKNOWN;
+        cmd.error_msg = "PUT requires exactly 3 arguments: metric_name timestamp value";
+        return cmd;
+    }
+    string metric = line.substr(s1, e1 - s1);
+
+    auto [s2, e2] = next_token(line, e1); // timestamp
+    if (s2 == string::npos)
+    {
+        cmd.type = CommandType::UNKNOWN;
+        cmd.error_msg = "PUT requires exactly 3 arguments: metric_name timestamp value";
+        return cmd;
+    }
+
+    auto [s3, e3] = next_token(line, e2); // value
+    if (s3 == string::npos)
+    {
+        cmd.type = CommandType::UNKNOWN;
+        cmd.error_msg = "PUT requires exactly 3 arguments: metric_name timestamp value";
+        return cmd;
+    }
+
+    // Check no extra tokens
+    auto [s4, e4] = next_token(line, e3);
+    if (s4 != string::npos)
+    {
+        cmd.type = CommandType::UNKNOWN;
+        cmd.error_msg = "PUT requires exactly 3 arguments: metric_name timestamp value";
+        return cmd;
+    }
+
+    if (!valid_metric_name(metric))
+    {
+        cmd.type = CommandType::UNKNOWN;
+        cmd.error_msg = "invalid metric name: " + metric;
+        return cmd;
+    }
+
+    int64_t ts;
+    double val;
+    if (!fast_parse_int64(line.data() + s2, line.data() + e2, ts))
+    {
+        cmd.type = CommandType::UNKNOWN;
+        cmd.error_msg = "invalid timestamp: " + line.substr(s2, e2 - s2);
+        return cmd;
+    }
+    if (!fast_parse_double(line.data() + s3, line.data() + e3, val))
+    {
+        cmd.type = CommandType::UNKNOWN;
+        cmd.error_msg = "invalid value: " + line.substr(s3, e3 - s3);
+        return cmd;
+    }
+
+    cmd.type = CommandType::PUT;
+    cmd.metric_name = move(metric);
+    cmd.timestamp = ts;
+    cmd.value = val;
+    return cmd;
+}
+
 Command parse_command(const string &line)
 {
     Command cmd;
+
+    // Fast-path: detect PUT early (the hot path)
+    if (line.size() > 4 && line[0] == 'P' && line[1] == 'U' && line[2] == 'T' && line[3] == ' ')
+    {
+        return parse_put_fast(line);
+    }
+
     vector<string> tokens = tokenize(line);
 
     if (tokens.empty())
@@ -75,42 +199,6 @@ Command parse_command(const string &line)
     }
 
     const string &name = tokens[0];
-
-    // ── PUT metric_name timestamp value ──────────────────────────────────
-    if (name == "PUT")
-    {
-        if (tokens.size() != 4)
-        {
-            cmd.type = CommandType::UNKNOWN;
-            cmd.error_msg = "PUT requires exactly 3 arguments: metric_name timestamp value";
-            return cmd;
-        }
-        if (!valid_metric_name(tokens[1]))
-        {
-            cmd.type = CommandType::UNKNOWN;
-            cmd.error_msg = "invalid metric name: " + tokens[1];
-            return cmd;
-        }
-        int64_t ts;
-        double val;
-        if (!parse_int64(tokens[2], ts))
-        {
-            cmd.type = CommandType::UNKNOWN;
-            cmd.error_msg = "invalid timestamp: " + tokens[2];
-            return cmd;
-        }
-        if (!parse_double(tokens[3], val))
-        {
-            cmd.type = CommandType::UNKNOWN;
-            cmd.error_msg = "invalid value: " + tokens[3];
-            return cmd;
-        }
-        cmd.type = CommandType::PUT;
-        cmd.metric_name = tokens[1];
-        cmd.timestamp = ts;
-        cmd.value = val;
-        return cmd;
-    }
 
     // ── GET metric_name from_ts to_ts ─────────────────────────────────────
     if (name == "GET")

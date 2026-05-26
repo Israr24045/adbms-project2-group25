@@ -7,6 +7,7 @@
 #include <cstring>
 #include <thread>
 #include <iomanip>
+#include <chrono>
 
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -46,11 +47,57 @@ static string format_value(double v)
 
 Server::Server(const string &data_dir, int port) : data_dir_(data_dir), port_(port) {}
 
+Server::~Server()
+{
+    bg_running_ = false;
+    if (bg_thread_.joinable())
+        bg_thread_.join();
+}
+
+void Server::set_default_retention(int64_t seconds)
+{
+    registry_.set_default_retention(seconds);
+}
+
+// ── Background thread: retention enforcement + downsampling ───────────────
+// Runs every 60 seconds.
+
+void Server::background_loop()
+{
+    while (bg_running_)
+    {
+        for (int i = 0; i < 60 && bg_running_; ++i)
+            this_thread::sleep_for(chrono::seconds(1));
+
+        if (!bg_running_)
+            break;
+
+        auto now = chrono::system_clock::now();
+        int64_t now_ts = chrono::duration_cast<chrono::seconds>(
+                             now.time_since_epoch())
+                             .count();
+
+        // Enforce retention policies
+        registry_.enforce_retention(now_ts, data_dir_);
+
+        // Downsample old chunks
+        registry_.downsample_old_chunks(data_dir_, now_ts);
+    }
+}
+
 void Server::run()
 {
     // Scan data directory at startup to discover existing metrics/chunks
     cout << "Scanning data directory: " << data_dir_ << "\n";
     registry_.scan_data_dir(data_dir_);
+
+    // Replay WALs for crash recovery
+    cout << "Replaying WALs for crash recovery...\n";
+    registry_.replay_wals(data_dir_);
+
+    // Start background thread for retention + downsampling
+    bg_running_ = true;
+    bg_thread_ = thread(&Server::background_loop, this);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0)
@@ -107,7 +154,16 @@ void Server::handle_client(int client_fd)
 {
     string buffer;
     size_t buffer_start = 0;
-    char recv_buf[4096];
+    char recv_buf[65536];   // 64 KB — read many commands per syscall
+
+    // Response batching: accumulate responses for all commands parsed from
+    // a single recv() and send them in one write.
+    string resp_batch;
+    resp_batch.reserve(16384);
+
+    string last_metric;
+    HeadBlock *last_block = nullptr;
+    WAL *last_wal = nullptr;
 
     while (true)
     {
@@ -118,15 +174,14 @@ void Server::handle_client(int client_fd)
         }
         buffer.append(recv_buf, n);
 
+        resp_batch.clear();
+        bool quit = false;
+
         size_t pos;
         while ((pos = buffer.find('\n', buffer_start)) != string::npos)
         {
             string line = buffer.substr(buffer_start, pos - buffer_start);
             buffer_start = pos + 1;
-            if (buffer_start > 8192) {
-                buffer.erase(0, buffer_start);
-                buffer_start = 0;
-            }
 
             if (!line.empty() && line.back() == '\r')
             {
@@ -142,18 +197,33 @@ void Server::handle_client(int client_fd)
 
             case CommandType::PUT:
             {
-                HeadBlock *block = registry_.get_or_create(cmd.metric_name);
+                HeadBlock *block;
+                WAL *wal;
+
+                if (cmd.metric_name == last_metric && last_block != nullptr) {
+                    block = last_block;
+                    wal = last_wal;
+                } else {
+                    block = registry_.get_or_create(cmd.metric_name);
+                    wal = registry_.get_or_create_wal(cmd.metric_name, data_dir_);
+                    last_metric = cmd.metric_name;
+                    last_block = block;
+                    last_wal = wal;
+                }
+                
                 bool need_flush = false;
+
                 {
                     lock_guard<mutex> lk(block->lock);
                     auto result = block->append(cmd.timestamp, cmd.value);
                     switch (result)
                     {
                     case HeadBlock::AppendResult::OK:
-                        send_all(client_fd, "OK\n");
+                        wal->append(cmd.timestamp, cmd.value);
+                        resp_batch += "OK\n";
                         break;
                     case HeadBlock::AppendResult::OUT_OF_ORDER:
-                        send_all(client_fd, "ERROR: out-of-order timestamp\n");
+                        resp_batch += "ERROR: out-of-order timestamp\n";
                         break;
                     case HeadBlock::AppendResult::BLOCK_FULL:
                         need_flush = true;
@@ -163,7 +233,7 @@ void Server::handle_client(int client_fd)
                 if (need_flush)
                 {
                     // Auto-flush: flush the full head block to disk,
-                    // then retry the append.
+                    // then retry the append.  flush_metric() truncates the WAL.
                     FlushStats fs = registry_.flush_metric(cmd.metric_name, data_dir_);
                     if (fs.total_bytes > 0)
                     {
@@ -177,11 +247,12 @@ void Server::handle_client(int client_fd)
                     auto retry = block->append(cmd.timestamp, cmd.value);
                     if (retry == HeadBlock::AppendResult::OK)
                     {
-                        send_all(client_fd, "OK\n");
+                        wal->append(cmd.timestamp, cmd.value);
+                        resp_batch += "OK\n";
                     }
                     else
                     {
-                        send_all(client_fd, "ERROR: append failed after auto-flush\n");
+                        resp_batch += "ERROR: append failed after auto-flush\n";
                     }
                 }
                 break;
@@ -189,15 +260,12 @@ void Server::handle_client(int client_fd)
 
             case CommandType::GET:
             {
-                // Full range query: disk chunks + head block
                 auto range = registry_.full_range(cmd.metric_name, cmd.from_ts, cmd.to_ts);
-                string response;
                 for (size_t i = 0; i < range.timestamps.size(); ++i)
                 {
-                    response += to_string(range.timestamps[i]) + " " + format_value(range.values[i]) + "\n";
+                    resp_batch += to_string(range.timestamps[i]) + " " + format_value(range.values[i]) + "\n";
                 }
-                response += "(" + to_string(range.timestamps.size()) + " points)\n";
-                send_all(client_fd, response);
+                resp_batch += "(" + to_string(range.timestamps.size()) + " points)\n";
                 break;
             }
 
@@ -242,20 +310,17 @@ void Server::handle_client(int client_fd)
                 size_t total = in_mem + on_disk;
                 if (total == 0 && !block && !ds)
                 {
-                    // Metric doesn't exist at all
                     first_ts = 0;
                     last_ts_val = 0;
                 }
 
-                string response;
-                response = "metric: " + cmd.metric_name + "\n";
-                response += "total points: " + to_string(total) + "\n";
-                response += "in memory: " + to_string(in_mem) + "\n";
-                response += "on disk: " + to_string(on_disk) + "\n";
-                response += "disk chunks: " + to_string(disk_chunks) + "\n";
-                response += "first timestamp: " + to_string(first_ts) + "\n";
-                response += "last timestamp: " + to_string(last_ts_val) + "\n";
-                send_all(client_fd, response);
+                resp_batch += "metric: " + cmd.metric_name + "\n";
+                resp_batch += "total points: " + to_string(total) + "\n";
+                resp_batch += "in memory: " + to_string(in_mem) + "\n";
+                resp_batch += "on disk: " + to_string(on_disk) + "\n";
+                resp_batch += "disk chunks: " + to_string(disk_chunks) + "\n";
+                resp_batch += "first timestamp: " + to_string(first_ts) + "\n";
+                resp_batch += "last timestamp: " + to_string(last_ts_val) + "\n";
                 break;
             }
 
@@ -264,7 +329,7 @@ void Server::handle_client(int client_fd)
                 HeadBlock *block = registry_.get(cmd.metric_name);
                 if (!block)
                 {
-                    send_all(client_fd, "ERROR: unknown metric: " + cmd.metric_name + "\n");
+                    resp_batch += "ERROR: unknown metric: " + cmd.metric_name + "\n";
                     break;
                 }
 
@@ -276,10 +341,11 @@ void Server::handle_client(int client_fd)
 
                 if (pts == 0)
                 {
-                    send_all(client_fd, "Nothing to flush (head block empty)\n");
+                    resp_batch += "Nothing to flush (head block empty)\n";
                     break;
                 }
 
+                // flush_metric() also truncates the WAL
                 FlushStats fs = registry_.flush_metric(cmd.metric_name, data_dir_);
                 if (fs.total_bytes > 0)
                 {
@@ -296,11 +362,11 @@ void Server::handle_client(int client_fd)
                         << ratio << "x"
                         << (fs.point_count < 100 ? " (small chunk, ratio improves with size)" : "")
                         << "\n";
-                    send_all(client_fd, oss.str());
+                    resp_batch += oss.str();
                 }
                 else
                 {
-                    send_all(client_fd, "ERROR: flush failed\n");
+                    resp_batch += "ERROR: flush failed\n";
                 }
                 break;
             }
@@ -310,29 +376,53 @@ void Server::handle_client(int client_fd)
                 AggResult agg = registry_.agg_range(cmd.metric_name,
                                                     cmd.from_ts, cmd.to_ts,
                                                     cmd.bucket_seconds, cmd.agg_func);
-                string response;
                 for (const auto &b : agg.buckets)
                 {
-                    response += to_string(b.bucket_start) + "-" + to_string(b.bucket_end) + " " + format_value(b.value) + "\n";
+                    resp_batch += to_string(b.bucket_start) + "-" + to_string(b.bucket_end) + " " + format_value(b.value) + "\n";
                 }
-                response += "(" + to_string(agg.buckets.size()) + " buckets)\n";
-                send_all(client_fd, response);
+                resp_batch += "(" + to_string(agg.buckets.size()) + " buckets)\n";
                 break;
             }
 
             case CommandType::QUIT:
             {
-                send_all(client_fd, "BYE\n");
-                close(client_fd);
-                return;
+                resp_batch += "BYE\n";
+                quit = true;
+                break;
             }
 
             case CommandType::UNKNOWN:
             {
-                send_all(client_fd, "ERROR: " + cmd.error_msg + "\n");
+                resp_batch += "ERROR: " + cmd.error_msg + "\n";
                 break;
             }
             }
+
+            if (quit) break;
+        }
+
+        // Send all accumulated responses in one syscall
+        if (!resp_batch.empty())
+        {
+            if (!send_all(client_fd, resp_batch))
+            {
+                break;
+            }
+        }
+
+        if (buffer_start > 0) {
+            buffer.erase(0, buffer_start);
+            buffer_start = 0;
+        }
+
+        if (last_wal) {
+            last_wal->flush();
+        }
+
+        if (quit)
+        {
+            close(client_fd);
+            return;
         }
     }
 
